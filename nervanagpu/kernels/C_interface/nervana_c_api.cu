@@ -22,6 +22,9 @@
 #include <iostream>
 #include <sstream>
 #include <mutex>
+#include <utility>
+#include <tuple>
+#include <stdint.h>
 #include "nervana_c_api.h"
 
 std::map<CUdevice, int> nervana_sm_counts_;
@@ -37,7 +40,7 @@ extern "C" bool nervana_loadKernels(const char* const base_path_cstr) {
 
     //better would be a vector<string>, but there is a bug in nvcc that prevents this
     // (bug report filed)
-    std::string names[28] = {
+    std::string names[38] = {
         "hgemm_nn_vec_128x128",
         "hgemm_nn_128x128",
         "hgemm_nt_vec_128x128",
@@ -52,6 +55,11 @@ extern "C" bool nervana_loadKernels(const char* const base_path_cstr) {
         "hgemm_nn_128x32",
         "hgemm_tn_vec_128x32",
         "hgemm_tn_128x32",
+        "hconv_fprop_K64_N64",
+        "hconv_bprop_C128_N64",
+        "hconv_updat_C128_K128",
+        "hconv_updat_C64_K64",
+        "hpool_max",
         "sgemm_nn_vec_128x128",
         "sgemm_nn_128x128",
         "sgemm_nt_vec_128x128",
@@ -66,6 +74,11 @@ extern "C" bool nervana_loadKernels(const char* const base_path_cstr) {
         "sgemm_nn_128x32",
         "sgemm_tn_vec_128x32",
         "sgemm_tn_128x32",
+        "sconv_fprop_K64_N64",
+        "sconv_bprop_C128_N64",
+        "sconv_updat_C128_K128",
+        "sconv_updat_C128_K64",
+        "spool_max"
     };
 
     std::string base_path(base_path_cstr);
@@ -330,6 +343,470 @@ extern "C" bool nervana_hgemm(short *A, short *B, short *C,
 
     if (res != CUDA_SUCCESS) {
         std::cerr << "Error launching kernel " << name << " " << res << std::endl;
+        return false;
+    }
+
+    return true;
+}
+
+//implementation adapted from the python version
+//it upcasts intermediate results to avoid possible numerical problems
+std::pair<uint32_t, uint32_t> magic32(uint32_t nmax_, uint32_t d_) {
+    uint64_t nmax = nmax_;
+    uint64_t d    = d_;
+
+    uint64_t nc = ((nmax + 1) / d) * d - 1;
+    uint64_t nbits = 32 - __builtin_clz(nmax);
+    for (uint64_t p = 0; p < 2 * nbits + 1; ++p) {
+        uint64_t two_powp = 1UL << p;
+        if (two_powp > nc * (d - 1 - (two_powp - 1) % d)) {
+            int m = (two_powp + d - 1 - two_powp % d) / d;
+            return std::make_pair(m, p);
+        }
+    }
+    return std::make_pair(0, 0);
+}
+
+extern "C"
+bool nervana_sconv_fprop(unsigned int *rand_state,
+                         float *O, float *I, float *F,
+                         float alpha,
+                         int N, int C, int K, int D, int H, int W, int T, int R, int S,
+                         int pad_d, int pad_h, int pad_w, int str_d, int str_h, int str_w,
+                         CUstream stream
+                         )
+{
+    if(N % 8 != 0 || K % 8 != 0) {
+        std::cerr << "sconv_fprop N and K must be multiples of 8" << std::endl;
+        return false;
+    }
+
+    int M = ceil(static_cast<float>(D - T + 1 + 2 * pad_d) / str_d);
+    int P = ceil(static_cast<float>(H - R + 1 + 2 * pad_h) / str_h);
+    int Q = ceil(static_cast<float>(W - S + 1 + 2 * pad_w) / str_w);
+
+    int WN = W * N;
+    int HWN = H * WN;
+    int DHWN = D * HWN;
+    int RS = R * S;
+    int RST = RS * T;
+    int CRST = C * RST;
+    int PQ = P * Q;
+    int PM = P * M;
+    int PQM = P * Q * M;
+    int QN = Q * N;
+    int PQN = P * QN;
+    int MPQN = M * PQN;
+
+    if (PQM >= (1 << 16) || CRST + 8 >= (1 << 16)) {
+        std::cerr << "Dimensions require more than 16-bits, currently not supported" << std::endl;
+        return false;
+    }
+
+    int grid_N64 = N / 64 + (N % 64 != 0);
+    int grid_K64 = K / 64 + (K % 64 != 0);
+    int grid_C64 = CRST / 64 + (CRST % 64 != 0);
+
+    int grid_N128 = N / 128 + (N % 128 != 0);
+    int grid_K128 = K / 128 + (K % 128 != 0);
+    int grid_C128 = CRST / 128 + (CRST % 128 != 0);
+
+    int grid_P = P;
+    int grid_Q = Q / 4;
+
+    int sm_count;
+    {
+        std::lock_guard<std::mutex> lock(nervana_sm_count_mutex_);
+
+        CUdevice device;
+        CUresult res = cuCtxGetDevice(&device);
+        if (res != CUDA_SUCCESS) {
+            return false;
+        }
+        auto count = nervana_sm_counts_.find(device);
+        if (count != nervana_sm_counts_.end()) {
+            sm_count = count->second;
+        }
+        else {
+            int pi;
+            res = cuDeviceGetAttribute(&pi, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device);
+            if (res != CUDA_SUCCESS) {
+                return false;
+            }
+            sm_count = pi;
+            nervana_sm_counts_[device] = pi;
+        }
+    }
+
+    if (sm_count == 24) {
+        int grid_PQ = grid_P * grid_Q;
+        if (grid_PQ < 30) {
+            grid_P = 6;
+            grid_Q = 4;
+        }
+        else if (grid_PQ < 54) {
+            grid_P = 8;
+            grid_Q = 6;
+        }
+        else if (grid_PQ <  78) {
+            grid_P = 9;
+            grid_Q = 8;
+        }
+        else if (grid_PQ < 108) {
+            grid_P = 12;
+            grid_Q = 8;
+        }
+    }
+
+    grid_P = min(grid_P, P);
+    grid_Q = min(grid_Q, Q);
+
+    int grid_PQ = grid_P * grid_Q;
+    int grid_PQM = grid_PQ * M;
+
+    int magic_RST_m, magic_RST_p;
+    int magic_RS_m, magic_RS_p;
+    int magic_S_m, magic_S_p;
+    int magic_Q_m, magic_Q_p;
+    int magic_PQ_m, magic_PQ_p;
+
+    std::tie(magic_RST_m, magic_RST_p) = magic32(CRST + 8, RST);
+    std::tie(magic_RS_m, magic_RS_p) = magic32(RST + 32, RS);
+    std::tie(magic_S_m, magic_S_p) = magic32(RS + 32, S);
+    std::tie(magic_Q_m, magic_Q_p) = magic32(PQ, P);
+    std::tie(magic_PQ_m, magic_PQ_p) = magic32(PQM, PQ);
+
+    int lut_size = (RST / 32 + (RST + 32 != 0)) * 32 * 4;
+
+    int flags = 0;
+
+    void *args[44] = {&rand_state, &O, &I, &F, &alpha, &flags, &N, &K, &D, &H, &W, &WN, &HWN, &DHWN,
+                                   &C, &CRST, &RST, &magic_RST_m, &magic_RST_p,
+                                   &RS, &magic_RS_m, &magic_RS_p,
+                                   &S, &magic_S_m, &magic_S_p,
+                                   &pad_d, &pad_h, &pad_w, &str_d, &str_h, &str_w,
+                                   &P, &Q, &PQ, &QN, &PQN, &MPQN,
+                                   &magic_Q_m, &magic_Q_p,
+                                   &magic_PQ_m, &magic_PQ_p,
+                                   &grid_P, &grid_Q, &grid_PQ};
+
+
+    CUresult res = cuLaunchKernel(nervana_kernels_[std::string("sconv_fprop_K64_N64")],
+                                  PQM, grid_K64, grid_N64,
+                                  64, 1, 1,
+                                  0,
+                                  stream, args, NULL);
+
+    if (res != CUDA_SUCCESS) {
+        std::cerr << "Error launching kernel sconv_fprop_K64_N64" << " " << res << std::endl;
+        return false;
+    }
+
+    return true;
+}
+
+//grad_I = output
+//F = filters
+//E = deltas from previous layer
+
+extern "C"
+bool nervana_sconv_bprop(unsigned int *rand_state,
+                         float *grad_I, float *F, float *E,
+                         float alpha,
+                         int N, int C, int K, int D, int H, int W, int T, int R, int S,
+                         int pad_d, int pad_h, int pad_w, int str_d, int str_h, int str_w,
+                         CUstream stream
+                         )
+{
+    if(N % 8 != 0 || K % 8 != 0) {
+        std::cerr << "sconv_bprop N and K must be multiples of 8" << std::endl;
+        return false;
+    }
+
+    int M = ceil(static_cast<float>(D - T + 1 + 2 * pad_d) / str_d);
+    int P = ceil(static_cast<float>(H - R + 1 + 2 * pad_h) / str_h);
+    int Q = ceil(static_cast<float>(W - S + 1 + 2 * pad_w) / str_w);
+
+    int WN = W * N;
+    int HWN = H * WN;
+    int DHWN = D * HWN;
+    int RS = R * S;
+    int RST = RS * T;
+    int CRST = C * RST;
+    int PQ = P * Q;
+    int PM = P * M;
+    int PQM = P * Q * M;
+    int QN = Q * N;
+    int PQN = P * QN;
+    int MPQN = M * PQN;
+
+    if (PQM >= (1 << 16) || CRST + 8 >= (1 << 16)) {
+        std::cerr << "Dimensions require more than 16-bits, currently not supported" << std::endl;
+        return false;
+    }
+
+    int grid_N64 = N / 64 + (N % 64 != 0);
+    int grid_K64 = K / 64 + (K % 64 != 0);
+    int grid_C64 = CRST / 64 + (CRST % 64 != 0);
+
+    int grid_N128 = N / 128 + (N % 128 != 0);
+    int grid_K128 = K / 128 + (K % 128 != 0);
+    int grid_C128 = CRST / 128 + (CRST % 128 != 0);
+
+    int grid_P = P;
+    int grid_Q = Q / 4;
+
+    int sm_count;
+    {
+        std::lock_guard<std::mutex> lock(nervana_sm_count_mutex_);
+
+        CUdevice device;
+        CUresult res = cuCtxGetDevice(&device);
+        if (res != CUDA_SUCCESS) {
+            return false;
+        }
+        auto count = nervana_sm_counts_.find(device);
+        if (count != nervana_sm_counts_.end()) {
+            sm_count = count->second;
+        }
+        else {
+            int pi;
+            res = cuDeviceGetAttribute(&pi, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device);
+            if (res != CUDA_SUCCESS) {
+                return false;
+            }
+            sm_count = pi;
+            nervana_sm_counts_[device] = pi;
+        }
+    }
+
+    if (sm_count == 24) {
+        int grid_PQ = grid_P * grid_Q;
+        if (grid_PQ < 30) {
+            grid_P = 6;
+            grid_Q = 4;
+        }
+        else if (grid_PQ < 54) {
+            grid_P = 8;
+            grid_Q = 6;
+        }
+        else if (grid_PQ <  78) {
+            grid_P = 9;
+            grid_Q = 8;
+        }
+        else if (grid_PQ < 108) {
+            grid_P = 12;
+            grid_Q = 8;
+        }
+    }
+
+    grid_P = min(grid_P, P);
+    grid_Q = min(grid_Q, Q);
+
+    int grid_PQ = grid_P * grid_Q;
+    int grid_PQM = grid_PQ * M;
+
+    int magic_RST_m, magic_RST_p;
+    int magic_RS_m, magic_RS_p;
+    int magic_S_m, magic_S_p;
+    int magic_Q_m, magic_Q_p;
+    int magic_PQ_m, magic_PQ_p;
+
+    std::tie(magic_RST_m, magic_RST_p) = magic32(CRST + 8, RST);
+    std::tie(magic_RS_m, magic_RS_p) = magic32(RST + 32, RS);
+    std::tie(magic_S_m, magic_S_p) = magic32(RS + 32, S);
+    std::tie(magic_Q_m, magic_Q_p) = magic32(PQ, P);
+    std::tie(magic_PQ_m, magic_PQ_p) = magic32(PQM, PQ);
+
+    int lut_size = (RST / 32 + (RST + 32 != 0)) * 32 * 4;
+
+    int flags = 0;
+
+    void *args[44] = {&rand_state, &grad_I, &F, &E, &alpha, &flags, &N, &K, &D, &H, &W, &WN, &HWN, &DHWN,
+                                   &C, &CRST, &RST, &magic_RST_m, &magic_RST_p,
+                                   &RS, &magic_RS_m, &magic_RS_p,
+                                   &S, &magic_S_m, &magic_S_p,
+                                   &pad_d, &pad_h, &pad_w, &str_d, &str_h, &str_w,
+                                   &P, &Q, &PQ, &QN, &PQN, &MPQN,
+                                   &magic_Q_m, &magic_Q_p,
+                                   &magic_PQ_m, &magic_PQ_p,
+                                   &grid_P, &grid_Q, &grid_PQ};
+
+
+    CUresult res = cuLaunchKernel(nervana_kernels_[std::string("sconv_bprop_C128_N64")],
+                                  PQM, grid_C128, grid_N64,
+                                  128, 1, 1,
+                                  0,
+                                  stream, args, NULL);
+
+    if (res != CUDA_SUCCESS) {
+        std::cerr << "Error launching kernel sconv_fprop_K64_N64" << " " << res << std::endl;
+        return false;
+    }
+
+    return true;
+}
+
+//F = update to filters (or updated filters, not sure)
+//I = input
+//E = deltas
+
+extern "C"
+bool nervana_sconv_updat(unsigned int *rand_state,
+                         float *F, float *I, float *E,
+                         float alpha,
+                         int N, int C, int K, int D, int H, int W, int T, int R, int S,
+                         int pad_d, int pad_h, int pad_w, int str_d, int str_h, int str_w,
+                         CUstream stream
+                         )
+{
+    if(N % 8 != 0 || K % 8 != 0) {
+        std::cerr << "sconv_updat N and K must be multiples of 8" << std::endl;
+        return false;
+    }
+
+    int M = ceil(static_cast<float>(D - T + 1 + 2 * pad_d) / str_d);
+    int P = ceil(static_cast<float>(H - R + 1 + 2 * pad_h) / str_h);
+    int Q = ceil(static_cast<float>(W - S + 1 + 2 * pad_w) / str_w);
+
+    int WN = W * N;
+    int HWN = H * WN;
+    int DHWN = D * HWN;
+    int RS = R * S;
+    int RST = RS * T;
+    int CRST = C * RST;
+    int PQ = P * Q;
+    int PM = P * M;
+    int PQM = P * Q * M;
+    int QN = Q * N;
+    int PQN = P * QN;
+    int MPQN = M * PQN;
+
+    if (PQM >= (1 << 16) || CRST + 8 >= (1 << 16)) {
+        std::cerr << "Dimensions require more than 16-bits, currently not supported" << std::endl;
+        return false;
+    }
+
+    int grid_N64 = N / 64 + (N % 64 != 0);
+    int grid_K64 = K / 64 + (K % 64 != 0);
+    int grid_C64 = CRST / 64 + (CRST % 64 != 0);
+
+    int grid_N128 = N / 128 + (N % 128 != 0);
+    int grid_K128 = K / 128 + (K % 128 != 0);
+    int grid_C128 = CRST / 128 + (CRST % 128 != 0);
+
+    int grid_P = P;
+    int grid_Q = Q / 4;
+
+    int sm_count;
+    {
+        std::lock_guard<std::mutex> lock(nervana_sm_count_mutex_);
+
+        CUdevice device;
+        CUresult res = cuCtxGetDevice(&device);
+        if (res != CUDA_SUCCESS) {
+            return false;
+        }
+        auto count = nervana_sm_counts_.find(device);
+        if (count != nervana_sm_counts_.end()) {
+            sm_count = count->second;
+        }
+        else {
+            int pi;
+            res = cuDeviceGetAttribute(&pi, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device);
+            if (res != CUDA_SUCCESS) {
+                return false;
+            }
+            sm_count = pi;
+            nervana_sm_counts_[device] = pi;
+        }
+    }
+
+    if (sm_count == 24) {
+        int grid_PQ = grid_P * grid_Q;
+        if (grid_PQ < 30) {
+            grid_P = 6;
+            grid_Q = 4;
+        }
+        else if (grid_PQ < 54) {
+            grid_P = 8;
+            grid_Q = 6;
+        }
+        else if (grid_PQ <  78) {
+            grid_P = 9;
+            grid_Q = 8;
+        }
+        else if (grid_PQ < 108) {
+            grid_P = 12;
+            grid_Q = 8;
+        }
+    }
+
+    grid_P = min(grid_P, P);
+    grid_Q = min(grid_Q, Q);
+
+    int grid_PQ = grid_P * grid_Q;
+    int grid_PQM = grid_PQ * M;
+
+    dim3 grid;
+    int threads;
+    std::string update_size;
+    if (CRST <= 64 ||  K <= 64 || (K % 64 == 0 && K % 128 != 0)) {
+        grid.x = grid_PQM;
+        grid.y = grid_C128;
+        grid.z = grid_K64;
+        update_size = "C128_K64";
+        threads = 128;
+    }
+    else {
+        grid.x = grid_PQM;
+        grid.y = grid_C128;
+        grid.z = grid_K128;
+        update_size = "C128_K128";
+        threads = 256;
+    }
+
+    int magic_RST_m, magic_RST_p;
+    int magic_RS_m, magic_RS_p;
+    int magic_S_m, magic_S_p;
+    int magic_Q_m, magic_Q_p;
+    int magic_PQ_m, magic_PQ_p;
+    int magic_Qu_m, magic_Qu_p;
+    int magic_PQu_m, magic_PQu_p;
+
+    std::tie(magic_RST_m, magic_RST_p) = magic32(CRST + 8, RST);
+    std::tie(magic_RS_m, magic_RS_p) = magic32(RST + 32, RS);
+    std::tie(magic_S_m, magic_S_p) = magic32(RS + 32, S);
+    std::tie(magic_Q_m, magic_Q_p) = magic32(PQ, P);
+    std::tie(magic_PQ_m, magic_PQ_p) = magic32(PQM, PQ);
+    std::tie(magic_Qu_m, magic_Qu_p) = magic32(grid_PQ, grid_Q);
+    std::tie(magic_PQu_m, magic_PQu_p) = magic32(grid_PQM, grid_PQ);
+
+    int lut_size = (RST / 32 + (RST + 32 != 0)) * 32 * 4;
+
+    int flags = 0;
+
+    void *args[44] = {&rand_state, &F, &I, &E, &alpha, &flags,
+                                   &N, &K, &D, &H, &W, &WN, &HWN, &DHWN,
+                                   &C, &CRST, &RST, &magic_RST_m, &magic_RST_p,
+                                   &RS, &magic_RS_m, &magic_RS_p,
+                                   &S, &magic_S_m, &magic_S_p,
+                                   &pad_d, &pad_h, &pad_w, &str_d, &str_h, &str_w,
+                                   &P, &Q, &PQ, &QN, &PQN, &MPQN,
+                                   &magic_Qu_m, &magic_Qu_p,
+                                   &magic_PQu_m, &magic_PQu_p,
+                                   &grid_P, &grid_Q, &grid_PQ};
+
+
+    std::string kernel_name = std::string("sconv_updat_") + update_size;
+    CUresult res = cuLaunchKernel(nervana_kernels_[kernel_name],
+                                  grid.x, grid.y, grid.z,
+                                  threads, 1, 1,
+                                  0,
+                                  stream, args, NULL);
+
+    if (res != CUDA_SUCCESS) {
+        std::cerr << "Error launching kernel " << kernel_name << " " << res << std::endl;
         return false;
     }
 

@@ -105,6 +105,44 @@ bool nervana_unloadKernels();
                     CUstream stream
                     );
 
+
+
+//O = output
+//I = input
+//F = filters
+//D, H, W = size of input
+//T, R, S = size of filters
+//K = number of output feature maps (ie number of filters)
+//N = number of minibatches
+//C = number of input feature maps
+bool nervana_sconv_fprop(unsigned int *rand_state,
+                         float *O, float *I, float *F,
+                         float alpha,
+                         int N, int C, int K, int D, int H, int W, int T, int R, int S,
+                         int pad_d, int pad_h, int pad_w, int str_d, int str_h, int str_w,
+                         CUstream stream
+                         );
+
+//grad_I = output
+//F = filters
+//E = deltas from previous layer
+
+bool nervana_sconv_bprop(unsigned int *rand_state,
+                         float *grad_I, float *F, float *E,
+                         float alpha,
+                         int N, int C, int K, int D, int H, int W, int T, int R, int S,
+                         int pad_d, int pad_h, int pad_w, int str_d, int str_h, int str_w,
+                         CUstream stream
+                         );
+
+bool nervana_sconv_updat(unsigned int *rand_state,
+                         float *F, float *I, float *E,
+                         float alpha,
+                         int N, int C, int K, int D, int H, int W, int T, int R, int S,
+                         int pad_d, int pad_h, int pad_w, int str_d, int str_h, int str_w,
+                         CUstream stream
+                         );
+
 #ifdef __cplusplus
 }
 #endif
