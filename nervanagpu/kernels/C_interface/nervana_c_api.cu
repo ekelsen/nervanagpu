@@ -360,7 +360,7 @@ std::pair<uint32_t, uint32_t> magic32(uint32_t nmax_, uint32_t d_) {
     for (uint64_t p = 0; p < 2 * nbits + 1; ++p) {
         uint64_t two_powp = 1UL << p;
         if (two_powp > nc * (d - 1 - (two_powp - 1) % d)) {
-            int m = (two_powp + d - 1 - two_powp % d) / d;
+            int m = (two_powp + d - 1 - (two_powp - 1) % d) / d;
             return std::make_pair(m, p);
         }
     }
@@ -494,7 +494,7 @@ bool nervana_sconv_fprop(unsigned int *rand_state,
     CUresult res = cuLaunchKernel(nervana_kernels_[std::string("sconv_fprop_K64_N64")],
                                   PQM, grid_K64, grid_N64,
                                   64, 1, 1,
-                                  0,
+                                  lut_size,
                                   stream, args, NULL);
 
     if (res != CUDA_SUCCESS) {
@@ -636,7 +636,7 @@ bool nervana_sconv_bprop(unsigned int *rand_state,
     CUresult res = cuLaunchKernel(nervana_kernels_[std::string("sconv_bprop_C128_N64")],
                                   PQM, grid_C128, grid_N64,
                                   128, 1, 1,
-                                  0,
+                                  lut_size,
                                   stream, args, NULL);
 
     if (res != CUDA_SUCCESS) {
@@ -802,7 +802,7 @@ bool nervana_sconv_updat(unsigned int *rand_state,
     CUresult res = cuLaunchKernel(nervana_kernels_[kernel_name],
                                   grid.x, grid.y, grid.z,
                                   threads, 1, 1,
-                                  0,
+                                  lut_size,
                                   stream, args, NULL);
 
     if (res != CUDA_SUCCESS) {
